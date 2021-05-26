@@ -1,12 +1,6 @@
-# integer-encoding-rs
+# dusk-varint
 
-[![crates.io](https://img.shields.io/crates/v/integer-encoding.svg)](https://crates.io/crates/integer-encoding)
-[![Actions CI](https://github.com/dermesser/integer-encoding-rs/workflows/Actions%20CI/badge.svg)](https://github.com/dermesser/integer-encoding-rs/actions)
-
-[full documentation](https://docs.rs/integer-encoding/)
-
-This crate provides encoding and decoding of integers to and from bytestring
-representations.
+# minimal no_std fork of [integer-encoding](https://github.com/dermesser/integer-encoding-rs)
 
 The format is described here: [Google's protobuf integer encoding technique](https://developers.google.com/protocol-buffers/docs/encoding).
 
@@ -16,18 +10,6 @@ comprises each eight rounds of encoding (or decoding) a signed and an unsigned
 integer each -- divide the resulting benchmark time by 16 in order to have a
 rough estimate of time per operation. The integers are very large, so the
 results represent the worst case.
-
-## Crate
-
-If you use Tokio v0.2 and you use the asynchronous types in this crate (feature
-`tokio_async`), you may be interested in the `v2.0` branch. It is still
-maintained with the occasional fix for edge cases and depends on Tokio v0.2.
-
-## FixedInt
-
-`FixedInt` casts integers to bytes by either copying the underlying memory or
-performing a transmutation. The encoded values use machine endianness
-(little-endian on x86).
 
 ## VarInt
 

@@ -1,50 +1,188 @@
 //! Fast serialization of integers.
 //!
-//! This crate implements encoding and decoding of integer types to and from `FixedInt` (i.e. a
-//! representation of integers similar or equal to how they are stored in memory) as well as
-//! `VarInt` (encoding integers so that they only use as much memory as needed to represent their
-//! magnitude).
-//!
-//! This is useful when (de)serializing data from and to binary representations. For example,
-//! Protocol Buffers (by Google) use these kinds of encoding.
-//!
-//! ```
-//! use integer_encoding::*;
-//!
-//! fn main() {
-//!     let a: u32 = 344;
-//!     let encoded_byte_slice = a.encode_fixed_light();
-//!     assert_eq!(a, u32::decode_fixed(encoded_byte_slice));
-//!     assert_eq!(4, encoded_byte_slice.len());
-//!
-//!     let b: i32 = -111;
-//!     let encoded_byte_vec = b.encode_var_vec();
-//!     assert_eq!(Some((b, 2)), i32::decode_var(&encoded_byte_vec));
-//! }
-//! ```
+//! This crate implements encoding and decoding of integer types to and from `VarInt` (encoding
+//! integers so that they only use as much memory as needed to represent their magnitude).
 
-mod fixed;
-mod fixed_tests;
+#![no_std]
 
-mod varint;
-mod varint_tests;
+use core::u64;
 
-mod reader;
-mod writer;
+/// Most-significant byte, == 0x80
+pub const MSB: u8 = 0b1000_0000;
+/// All bits except for the most significant. Can be used as bitmask to drop the most-signficant
+/// bit using `&` (binary-and).
+const DROP_MSB: u8 = 0b0111_1111;
 
-pub use fixed::FixedInt;
-pub use varint::VarInt;
+/// How many bytes an integer uses when being encoded as a VarInt.
+#[inline]
+fn required_encoded_space_unsigned(mut v: u64) -> usize {
+    if v == 0 {
+        return 1;
+    }
 
-#[cfg(any(feature = "tokio_async", feature = "futures_async"))]
-pub use reader::FixedIntAsyncReader;
-pub use reader::FixedIntReader;
-#[cfg(any(feature = "tokio_async", feature = "futures_async"))]
-pub use reader::VarIntAsyncReader;
-pub use reader::VarIntReader;
+    let mut logcounter = 0;
+    while v > 0 {
+        logcounter += 1;
+        v >>= 7;
+    }
+    logcounter
+}
 
-#[cfg(any(feature = "tokio_async", feature = "futures_async"))]
-pub use writer::FixedIntAsyncWriter;
-pub use writer::FixedIntWriter;
-#[cfg(any(feature = "tokio_async", feature = "futures_async"))]
-pub use writer::VarIntAsyncWriter;
-pub use writer::VarIntWriter;
+/// How many bytes an integer uses when being encoded as a VarInt.
+#[inline]
+fn required_encoded_space_signed(v: i64) -> usize {
+    required_encoded_space_unsigned(zigzag_encode(v))
+}
+
+/// Varint (variable length integer) encoding, as described in
+/// https://developers.google.com/protocol-buffers/docs/encoding.
+///
+/// Uses zigzag encoding (also described there) for signed integer representation.
+pub trait VarInt: Sized + Copy {
+    /// Returns the number of bytes this number needs in its encoded form. Note: This varies
+    /// depending on the actual number you want to encode.
+    fn required_space(self) -> usize;
+    /// Decode a value from the slice. Returns the value and the number of bytes read from the
+    /// slice (can be used to read several consecutive values from a big slice)
+    /// return None if all bytes has MSB set.
+    fn decode_var(src: &[u8]) -> Option<(Self, usize)>;
+    /// Encode a value into the slice. The slice must be at least `required_space()` bytes long.
+    /// The number of bytes taken by the encoded integer is returned.
+    fn encode_var(self, src: &mut [u8]) -> usize;
+}
+
+#[inline]
+fn zigzag_encode(from: i64) -> u64 {
+    ((from << 1) ^ (from >> 63)) as u64
+}
+
+// see: http://stackoverflow.com/a/2211086/56332
+// casting required because operations like unary negation
+// cannot be performed on unsigned integers
+#[inline]
+fn zigzag_decode(from: u64) -> i64 {
+    ((from >> 1) ^ (-((from & 1) as i64)) as u64) as i64
+}
+
+macro_rules! impl_varint {
+    ($t:ty, unsigned) => {
+        impl VarInt for $t {
+            fn required_space(self) -> usize {
+                required_encoded_space_unsigned(self as u64)
+            }
+
+            fn decode_var(src: &[u8]) -> Option<(Self, usize)> {
+                let (n, s) = u64::decode_var(src)?;
+                Some((n as Self, s))
+            }
+
+            fn encode_var(self, dst: &mut [u8]) -> usize {
+                (self as u64).encode_var(dst)
+            }
+        }
+    };
+    ($t:ty, signed) => {
+        impl VarInt for $t {
+            fn required_space(self) -> usize {
+                required_encoded_space_signed(self as i64)
+            }
+
+            fn decode_var(src: &[u8]) -> Option<(Self, usize)> {
+                let (n, s) = i64::decode_var(src)?;
+                Some((n as Self, s))
+            }
+
+            fn encode_var(self, dst: &mut [u8]) -> usize {
+                (self as i64).encode_var(dst)
+            }
+        }
+    };
+}
+
+impl_varint!(u32, unsigned);
+impl_varint!(u16, unsigned);
+impl_varint!(u8, unsigned);
+
+impl_varint!(i32, signed);
+impl_varint!(i16, signed);
+impl_varint!(i8, signed);
+
+// Below are the "base implementations" doing the actual encodings; all other integer types are
+// first cast to these biggest types before being encoded.
+
+impl VarInt for u64 {
+    fn required_space(self) -> usize {
+        required_encoded_space_unsigned(self)
+    }
+
+    #[inline]
+    fn decode_var(src: &[u8]) -> Option<(Self, usize)> {
+        let mut result: u64 = 0;
+        let mut shift = 0;
+
+        let mut success = false;
+        for b in src.iter() {
+            let msb_dropped = b & DROP_MSB;
+            result |= (msb_dropped as u64) << shift;
+            shift += 7;
+
+            if b & MSB == 0 || shift > (9 * 7) {
+                success = b & MSB == 0;
+                break;
+            }
+        }
+
+        if success {
+            Some((result, shift / 7 as usize))
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn encode_var(self, dst: &mut [u8]) -> usize {
+        assert!(dst.len() >= self.required_space());
+        let mut n = self;
+        let mut i = 0;
+
+        while n >= 0x80 {
+            dst[i] = MSB | (n as u8);
+            i += 1;
+            n >>= 7;
+        }
+
+        dst[i] = n as u8;
+        i + 1
+    }
+}
+
+impl VarInt for i64 {
+    fn required_space(self) -> usize {
+        required_encoded_space_signed(self)
+    }
+
+    #[inline]
+    fn decode_var(src: &[u8]) -> Option<(Self, usize)> {
+        if let Some((result, size)) = u64::decode_var(src) {
+            Some((zigzag_decode(result) as Self, size))
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn encode_var(self, dst: &mut [u8]) -> usize {
+        assert!(dst.len() >= self.required_space());
+        let mut n: u64 = zigzag_encode(self as i64);
+        let mut i = 0;
+
+        while n >= 0x80 {
+            dst[i] = MSB | (n as u8);
+            i += 1;
+            n >>= 7;
+        }
+
+        dst[i] = n as u8;
+        i + 1
+    }
+}
